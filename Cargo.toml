@@ -1,0 +1,6 @@
+[package]
+name = "namesmith"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Random name generation from word lists, strict by default"
