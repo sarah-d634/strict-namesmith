@@ -75,6 +75,36 @@ let generator = NameGenerator::with_strictness(
 assert!(generator.is_ok());
 ```
 
+## Patterns beyond "first last"
+
+`NameGenerator` only ever combines a first name and a last name. For
+anything else - a title, a quoted nickname, syllables stacked into a
+fantasy name - use `TemplateGenerator`, which takes a pattern string and
+any number of named slots:
+
+```rust
+use namesmith::{Rng, TemplateGenerator};
+
+let mut generator = TemplateGenerator::new(
+    "{title} {first} \"{nickname}\" {last}",
+    vec![
+        ("title", vec!["Capt.".to_string(), "Dr.".to_string()]),
+        ("first", vec!["Grace".to_string(), "Ada".to_string()]),
+        ("nickname", vec!["Amazing".to_string(), "Bug-finder".to_string()]),
+        ("last", vec!["Hopper".to_string(), "Lovelace".to_string()]),
+    ],
+    Rng::from_entropy(),
+)
+.expect("word lists should be clean");
+
+println!("{}", generator.generate());
+```
+
+Every slot's word list goes through the same strict-by-default validation
+as `NameGenerator`'s lists. A pattern that references a slot you didn't
+provide, or a `{` with no matching `}`, is also rejected at build time
+rather than producing a garbled name later.
+
 ## Design notes
 
 - Zero dependencies. The crate ships its own seedable PRNG
@@ -88,8 +118,10 @@ assert!(generator.is_ok());
 
 ## Status
 
-Early. Only "first + last" name pairs are supported right now; see the
-roadmap in commit history for what's planned.
+Early. `NameGenerator` covers "first + last" pairs and `TemplateGenerator`
+covers arbitrary patterns; entries still can't be weighted, so every list
+entry is equally likely. See the roadmap in commit history for what's
+planned.
 
 ## License
 

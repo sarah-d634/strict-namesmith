@@ -18,16 +18,37 @@
 //! let name = generator.generate();
 //! assert!(name.contains(' '));
 //! ```
+//!
+//! [`NameGenerator`] only ever produces "first last". For anything else -
+//! a title, a nickname in quotes, a fantasy name built from syllables -
+//! use [`TemplateGenerator`], which takes a pattern and any number of named
+//! slots:
+//!
+//! ```
+//! use namesmith::{Rng, TemplateGenerator};
+//!
+//! let mut generator = TemplateGenerator::new(
+//!     "{first} \"{nickname}\" {last}",
+//!     vec![
+//!         ("first", vec!["Grace".to_string()]),
+//!         ("nickname", vec!["Amazing".to_string()]),
+//!         ("last", vec!["Hopper".to_string()]),
+//!     ],
+//!     Rng::from_seed(1),
+//! )
+//! .unwrap();
+//! assert_eq!(generator.generate(), "Grace \"Amazing\" Hopper");
+//! ```
 
 mod rng;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 pub use rng::Rng;
 
 /// Controls how strictly input word lists are validated when building a
-/// [`NameGenerator`].
+/// [`NameGenerator`] or [`TemplateGenerator`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Strictness {
     /// Reject a list containing an empty entry, an entry with leading or
@@ -40,19 +61,19 @@ pub enum Strictness {
     Lenient,
 }
 
-/// Why building a [`NameGenerator`] failed.
+/// Why building a word list based generator failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildError {
     /// A list had no usable entries left after validation.
-    EmptyList(&'static str),
+    EmptyList(String),
     /// An entry was the empty string.
-    EmptyEntry { list: &'static str, index: usize },
+    EmptyEntry { list: String, index: usize },
     /// An entry had leading or trailing whitespace.
-    UntrimmedEntry { list: &'static str, entry: String },
+    UntrimmedEntry { list: String, entry: String },
     /// An entry contained a character outside `[A-Za-z-']`.
-    InvalidCharacter { list: &'static str, entry: String, ch: char },
+    InvalidCharacter { list: String, entry: String, ch: char },
     /// The same entry appeared more than once in a list.
-    DuplicateEntry { list: &'static str, entry: String },
+    DuplicateEntry { list: String, entry: String },
 }
 
 impl fmt::Display for BuildError {
@@ -119,7 +140,7 @@ impl NameGenerator {
 }
 
 fn validate_list(
-    list: &'static str,
+    list: &str,
     entries: Vec<String>,
     strictness: Strictness,
 ) -> Result<Vec<String>, BuildError> {
@@ -128,25 +149,32 @@ fn validate_list(
         Strictness::Lenient => validate_lenient(entries),
     };
     if entries.is_empty() {
-        return Err(BuildError::EmptyList(list));
+        return Err(BuildError::EmptyList(list.to_string()));
     }
     Ok(entries)
 }
 
-fn validate_strict(list: &'static str, entries: Vec<String>) -> Result<Vec<String>, BuildError> {
+fn validate_strict(list: &str, entries: Vec<String>) -> Result<Vec<String>, BuildError> {
     let mut seen = HashSet::new();
     for (index, entry) in entries.iter().enumerate() {
         if entry.is_empty() {
-            return Err(BuildError::EmptyEntry { list, index });
+            return Err(BuildError::EmptyEntry { list: list.to_string(), index });
         }
         if entry.trim() != entry {
-            return Err(BuildError::UntrimmedEntry { list, entry: entry.clone() });
+            return Err(BuildError::UntrimmedEntry {
+                list: list.to_string(),
+                entry: entry.clone(),
+            });
         }
         if let Some(ch) = entry.chars().find(|c| !is_name_char(*c)) {
-            return Err(BuildError::InvalidCharacter { list, entry: entry.clone(), ch });
+            return Err(BuildError::InvalidCharacter {
+                list: list.to_string(),
+                entry: entry.clone(),
+                ch,
+            });
         }
         if !seen.insert(entry.as_str()) {
-            return Err(BuildError::DuplicateEntry { list, entry: entry.clone() });
+            return Err(BuildError::DuplicateEntry { list: list.to_string(), entry: entry.clone() });
         }
     }
     Ok(entries)
@@ -171,6 +199,177 @@ fn is_name_char(c: char) -> bool {
     c.is_alphabetic() || c == '-' || c == '\''
 }
 
+/// Why building a [`TemplateGenerator`] failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateError {
+    /// The pattern string had no content.
+    EmptyPattern,
+    /// A `{` was never closed with a matching `}`.
+    UnterminatedPlaceholder { at: usize },
+    /// A `}` appeared with no preceding `{`.
+    UnmatchedClosingBrace { at: usize },
+    /// A `{}` placeholder had no slot name inside it.
+    EmptyPlaceholder { at: usize },
+    /// The same slot name was passed to the builder more than once.
+    DuplicateSlot { name: String },
+    /// The pattern referenced a slot name that wasn't passed to the builder.
+    UnknownSlot { name: String },
+    /// One of the slot's word lists failed validation.
+    List(BuildError),
+}
+
+impl fmt::Display for TemplateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TemplateError::EmptyPattern => write!(f, "pattern is empty"),
+            TemplateError::UnterminatedPlaceholder { at } => {
+                write!(f, "pattern has an unterminated '{{' at byte offset {at}")
+            }
+            TemplateError::UnmatchedClosingBrace { at } => {
+                write!(f, "pattern has an unmatched '}}' at byte offset {at}")
+            }
+            TemplateError::EmptyPlaceholder { at } => {
+                write!(f, "pattern has an empty {{}} placeholder at byte offset {at}")
+            }
+            TemplateError::DuplicateSlot { name } => {
+                write!(f, "slot {name:?} was passed to the builder more than once")
+            }
+            TemplateError::UnknownSlot { name } => {
+                write!(f, "pattern references slot {name:?}, which has no word list")
+            }
+            TemplateError::List(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for TemplateError {}
+
+impl From<BuildError> for TemplateError {
+    fn from(err: BuildError) -> Self {
+        TemplateError::List(err)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Piece {
+    Literal(String),
+    Slot(String),
+}
+
+/// Generates names from an arbitrary pattern such as `"{first} {last}"` or
+/// `"{title} {first} \"{nickname}\" {last}"`, picking one entry from each
+/// named slot's word list.
+///
+/// Where [`NameGenerator`] hardcodes a two-slot "first last" shape,
+/// `TemplateGenerator` accepts any number of named slots and a pattern that
+/// says how to arrange them, so callers aren't stuck with that one shape.
+pub struct TemplateGenerator {
+    slots: HashMap<String, Vec<String>>,
+    pieces: Vec<Piece>,
+    rng: Rng,
+}
+
+impl TemplateGenerator {
+    /// Builds a generator, validating every slot's word list under
+    /// [`Strictness::Strict`].
+    pub fn new(
+        pattern: &str,
+        slots: Vec<(&str, Vec<String>)>,
+        rng: Rng,
+    ) -> Result<Self, TemplateError> {
+        Self::with_strictness(pattern, slots, rng, Strictness::Strict)
+    }
+
+    /// Builds a generator, validating every slot's word list under the given
+    /// [`Strictness`].
+    pub fn with_strictness(
+        pattern: &str,
+        slots: Vec<(&str, Vec<String>)>,
+        rng: Rng,
+        strictness: Strictness,
+    ) -> Result<Self, TemplateError> {
+        if pattern.is_empty() {
+            return Err(TemplateError::EmptyPattern);
+        }
+        let pieces = parse_pattern(pattern)?;
+
+        let mut validated = HashMap::with_capacity(slots.len());
+        for (name, entries) in slots {
+            if validated.contains_key(name) {
+                return Err(TemplateError::DuplicateSlot { name: name.to_string() });
+            }
+            let entries = validate_list(name, entries, strictness)?;
+            validated.insert(name.to_string(), entries);
+        }
+
+        for piece in &pieces {
+            if let Piece::Slot(name) = piece {
+                if !validated.contains_key(name) {
+                    return Err(TemplateError::UnknownSlot { name: name.clone() });
+                }
+            }
+        }
+
+        Ok(TemplateGenerator { slots: validated, pieces, rng })
+    }
+
+    /// Renders the pattern once, picking a random entry from each slot's
+    /// word list.
+    pub fn generate(&mut self) -> String {
+        let mut out = String::new();
+        for piece in &self.pieces {
+            match piece {
+                Piece::Literal(text) => out.push_str(text),
+                Piece::Slot(name) => {
+                    let list = &self.slots[name];
+                    let entry = &list[self.rng.below(list.len())];
+                    out.push_str(entry);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Splits a pattern like `"{first} {last}"` into a sequence of literal text
+/// and named slot placeholders.
+fn parse_pattern(pattern: &str) -> Result<Vec<Piece>, TemplateError> {
+    let mut pieces = Vec::new();
+    let mut literal = String::new();
+    let mut chars = pattern.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '{' => {
+                if !literal.is_empty() {
+                    pieces.push(Piece::Literal(std::mem::take(&mut literal)));
+                }
+                let mut name = String::new();
+                let mut closed = false;
+                for (_, c2) in chars.by_ref() {
+                    if c2 == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(c2);
+                }
+                if !closed {
+                    return Err(TemplateError::UnterminatedPlaceholder { at: i });
+                }
+                if name.is_empty() {
+                    return Err(TemplateError::EmptyPlaceholder { at: i });
+                }
+                pieces.push(Piece::Slot(name));
+            }
+            '}' => return Err(TemplateError::UnmatchedClosingBrace { at: i }),
+            _ => literal.push(c),
+        }
+    }
+    if !literal.is_empty() {
+        pieces.push(Piece::Literal(literal));
+    }
+    Ok(pieces)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,7 +382,10 @@ mod tests {
     fn strict_rejects_empty_entry() {
         let err = NameGenerator::new(strs(&["Ada", ""]), strs(&["Lovelace"]), Rng::from_seed(0))
             .unwrap_err();
-        assert_eq!(err, BuildError::EmptyEntry { list: "first_names", index: 1 });
+        assert_eq!(
+            err,
+            BuildError::EmptyEntry { list: "first_names".to_string(), index: 1 }
+        );
     }
 
     #[test]
@@ -224,5 +426,87 @@ mod tests {
         let mut parts = name.split(' ');
         assert!(["Ada", "Grace"].contains(&parts.next().unwrap()));
         assert!(["Lovelace", "Hopper"].contains(&parts.next().unwrap()));
+    }
+
+    #[test]
+    fn template_renders_literals_and_slots() {
+        let mut generator = TemplateGenerator::new(
+            "{title} {first} {last}",
+            vec![
+                ("title", strs(&["Dr.", "Capt."])),
+                ("first", strs(&["Ada", "Grace"])),
+                ("last", strs(&["Lovelace", "Hopper"])),
+            ],
+            Rng::from_seed(9),
+        )
+        .unwrap();
+        let name = generator.generate();
+        let parts: Vec<&str> = name.split(' ').collect();
+        assert_eq!(parts.len(), 3);
+        assert!(["Dr.", "Capt."].contains(&parts[0]));
+        assert!(["Ada", "Grace"].contains(&parts[1]));
+        assert!(["Lovelace", "Hopper"].contains(&parts[2]));
+    }
+
+    #[test]
+    fn template_supports_repeated_and_adjacent_slots() {
+        let mut generator = TemplateGenerator::new(
+            "{syllable}{syllable}",
+            vec![("syllable", strs(&["ka", "mo", "ri"]))],
+            Rng::from_seed(4),
+        )
+        .unwrap();
+        let name = generator.generate();
+        assert_eq!(name.len(), 4);
+    }
+
+    #[test]
+    fn template_rejects_unknown_slot() {
+        let err = TemplateGenerator::new(
+            "{first} {last}",
+            vec![("first", strs(&["Ada"]))],
+            Rng::from_seed(0),
+        )
+        .unwrap_err();
+        assert_eq!(err, TemplateError::UnknownSlot { name: "last".to_string() });
+    }
+
+    #[test]
+    fn template_rejects_unterminated_placeholder() {
+        let err = TemplateGenerator::new(
+            "{first",
+            vec![("first", strs(&["Ada"]))],
+            Rng::from_seed(0),
+        )
+        .unwrap_err();
+        assert_eq!(err, TemplateError::UnterminatedPlaceholder { at: 0 });
+    }
+
+    #[test]
+    fn template_rejects_duplicate_slot() {
+        let err = TemplateGenerator::new(
+            "{first}",
+            vec![("first", strs(&["Ada"])), ("first", strs(&["Grace"]))],
+            Rng::from_seed(0),
+        )
+        .unwrap_err();
+        assert_eq!(err, TemplateError::DuplicateSlot { name: "first".to_string() });
+    }
+
+    #[test]
+    fn template_rejects_empty_pattern() {
+        let err = TemplateGenerator::new("", vec![], Rng::from_seed(0)).unwrap_err();
+        assert_eq!(err, TemplateError::EmptyPattern);
+    }
+
+    #[test]
+    fn template_propagates_list_validation_errors() {
+        let err = TemplateGenerator::new(
+            "{first}",
+            vec![("first", strs(&["Ada", "Ada"]))],
+            Rng::from_seed(0),
+        )
+        .unwrap_err();
+        assert!(matches!(err, TemplateError::List(BuildError::DuplicateEntry { .. })));
     }
 }
