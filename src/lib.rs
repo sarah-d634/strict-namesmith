@@ -53,10 +53,12 @@ pub use rng::Rng;
 pub enum Strictness {
     /// Reject a list containing an empty entry, an entry with leading or
     /// trailing whitespace, an entry with a character other than a letter,
-    /// hyphen, or apostrophe, or a duplicate entry. This is the default.
+    /// hyphen, or apostrophe, a duplicate entry, or (for a weighted list) an
+    /// entry with a weight of zero. This is the default.
     #[default]
     Strict,
-    /// Trim whitespace, drop empty entries, and drop duplicates instead of
+    /// Trim whitespace, drop empty entries, drop duplicates, and (for a
+    /// weighted list) drop entries with a weight of zero, instead of
     /// erroring. Characters outside the strict allow-list are kept as-is.
     Lenient,
 }
@@ -74,6 +76,9 @@ pub enum BuildError {
     InvalidCharacter { list: String, entry: String, ch: char },
     /// The same entry appeared more than once in a list.
     DuplicateEntry { list: String, entry: String },
+    /// An entry in a weighted list had a weight of zero, so it could never
+    /// be picked.
+    ZeroWeight { list: String, entry: String },
 }
 
 impl fmt::Display for BuildError {
@@ -94,6 +99,9 @@ impl fmt::Display for BuildError {
             BuildError::DuplicateEntry { list, entry } => {
                 write!(f, "{list} list has duplicate entry {entry:?}")
             }
+            BuildError::ZeroWeight { list, entry } => {
+                write!(f, "{list} list entry {entry:?} has a weight of zero")
+            }
         }
     }
 }
@@ -103,13 +111,15 @@ impl std::error::Error for BuildError {}
 /// Generates "First Last" names by picking one entry from a first-name list
 /// and one from a last-name list.
 pub struct NameGenerator {
-    first_names: Vec<String>,
-    last_names: Vec<String>,
+    first_names: Vec<(String, u32)>,
+    last_names: Vec<(String, u32)>,
     rng: Rng,
 }
 
 impl NameGenerator {
     /// Builds a generator, validating both lists under [`Strictness::Strict`].
+    /// Every entry is equally likely to be picked; use [`NameGenerator::new_weighted`]
+    /// if some names should come up more often than others.
     pub fn new(
         first_names: Vec<String>,
         last_names: Vec<String>,
@@ -126,24 +136,59 @@ impl NameGenerator {
         rng: Rng,
         strictness: Strictness,
     ) -> Result<Self, BuildError> {
+        Self::with_strictness_weighted(
+            to_weighted(first_names),
+            to_weighted(last_names),
+            rng,
+            strictness,
+        )
+    }
+
+    /// Builds a generator from weighted lists, validating both under
+    /// [`Strictness::Strict`]. An entry's weight controls how often it's
+    /// picked relative to the other entries in its list: a weight of 2 comes
+    /// up twice as often as a weight of 1.
+    pub fn new_weighted(
+        first_names: Vec<(String, u32)>,
+        last_names: Vec<(String, u32)>,
+        rng: Rng,
+    ) -> Result<Self, BuildError> {
+        Self::with_strictness_weighted(first_names, last_names, rng, Strictness::Strict)
+    }
+
+    /// Builds a generator from weighted lists, validating both under the
+    /// given [`Strictness`].
+    pub fn with_strictness_weighted(
+        first_names: Vec<(String, u32)>,
+        last_names: Vec<(String, u32)>,
+        rng: Rng,
+        strictness: Strictness,
+    ) -> Result<Self, BuildError> {
         let first_names = validate_list("first_names", first_names, strictness)?;
         let last_names = validate_list("last_names", last_names, strictness)?;
         Ok(NameGenerator { first_names, last_names, rng })
     }
 
-    /// Picks a random first name and last name and joins them with a space.
+    /// Picks a random first name and last name, weighted by their configured
+    /// weights, and joins them with a space.
     pub fn generate(&mut self) -> String {
-        let first = &self.first_names[self.rng.below(self.first_names.len())];
-        let last = &self.last_names[self.rng.below(self.last_names.len())];
+        let first = pick_weighted(&mut self.rng, &self.first_names);
+        let last = pick_weighted(&mut self.rng, &self.last_names);
         format!("{first} {last}")
     }
 }
 
+/// Pairs every entry with a weight of 1, so an unweighted list runs through
+/// the same validation and selection code as a weighted one.
+fn to_weighted(entries: Vec<String>) -> Vec<(String, u32)> {
+    entries.into_iter().map(|entry| (entry, 1)).collect()
+}
+
 fn validate_list(
     list: &str,
-    entries: Vec<String>,
+    entries: Vec<(String, u32)>,
     strictness: Strictness,
-) -> Result<Vec<String>, BuildError> {
+) -> Result<Vec<(String, u32)>, BuildError> {
     let entries = match strictness {
         Strictness::Strict => validate_strict(list, entries)?,
         Strictness::Lenient => validate_lenient(entries),
@@ -154,9 +199,12 @@ fn validate_list(
     Ok(entries)
 }
 
-fn validate_strict(list: &str, entries: Vec<String>) -> Result<Vec<String>, BuildError> {
+fn validate_strict(
+    list: &str,
+    entries: Vec<(String, u32)>,
+) -> Result<Vec<(String, u32)>, BuildError> {
     let mut seen = HashSet::new();
-    for (index, entry) in entries.iter().enumerate() {
+    for (index, (entry, weight)) in entries.iter().enumerate() {
         if entry.is_empty() {
             return Err(BuildError::EmptyEntry { list: list.to_string(), index });
         }
@@ -173,6 +221,9 @@ fn validate_strict(list: &str, entries: Vec<String>) -> Result<Vec<String>, Buil
                 ch,
             });
         }
+        if *weight == 0 {
+            return Err(BuildError::ZeroWeight { list: list.to_string(), entry: entry.clone() });
+        }
         if !seen.insert(entry.as_str()) {
             return Err(BuildError::DuplicateEntry { list: list.to_string(), entry: entry.clone() });
         }
@@ -180,16 +231,16 @@ fn validate_strict(list: &str, entries: Vec<String>) -> Result<Vec<String>, Buil
     Ok(entries)
 }
 
-fn validate_lenient(entries: Vec<String>) -> Vec<String> {
+fn validate_lenient(entries: Vec<(String, u32)>) -> Vec<(String, u32)> {
     let mut seen = HashSet::new();
     let mut cleaned = Vec::with_capacity(entries.len());
-    for entry in entries {
+    for (entry, weight) in entries {
         let trimmed = entry.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || weight == 0 {
             continue;
         }
         if seen.insert(trimmed.to_string()) {
-            cleaned.push(trimmed.to_string());
+            cleaned.push((trimmed.to_string(), weight));
         }
     }
     cleaned
@@ -197,6 +248,21 @@ fn validate_lenient(entries: Vec<String>) -> Vec<String> {
 
 fn is_name_char(c: char) -> bool {
     c.is_alphabetic() || c == '-' || c == '\''
+}
+
+/// Picks one entry from a validated, non-empty weighted list. An entry with
+/// weight `w` is `w` times as likely to be returned as one with weight 1.
+fn pick_weighted<'a>(rng: &mut Rng, entries: &'a [(String, u32)]) -> &'a str {
+    let total: u64 = entries.iter().map(|(_, weight)| *weight as u64).sum();
+    let mut target = rng.below(total as usize) as u64;
+    for (entry, weight) in entries {
+        let weight = *weight as u64;
+        if target < weight {
+            return entry;
+        }
+        target -= weight;
+    }
+    unreachable!("target should fall within the total weight of a non-empty list")
 }
 
 /// Why building a [`TemplateGenerator`] failed.
@@ -264,14 +330,16 @@ enum Piece {
 /// `TemplateGenerator` accepts any number of named slots and a pattern that
 /// says how to arrange them, so callers aren't stuck with that one shape.
 pub struct TemplateGenerator {
-    slots: HashMap<String, Vec<String>>,
+    slots: HashMap<String, Vec<(String, u32)>>,
     pieces: Vec<Piece>,
     rng: Rng,
 }
 
 impl TemplateGenerator {
     /// Builds a generator, validating every slot's word list under
-    /// [`Strictness::Strict`].
+    /// [`Strictness::Strict`]. Every entry in a slot is equally likely to be
+    /// picked; use [`TemplateGenerator::new_weighted`] if some entries should
+    /// come up more often than others.
     pub fn new(
         pattern: &str,
         slots: Vec<(&str, Vec<String>)>,
@@ -285,6 +353,32 @@ impl TemplateGenerator {
     pub fn with_strictness(
         pattern: &str,
         slots: Vec<(&str, Vec<String>)>,
+        rng: Rng,
+        strictness: Strictness,
+    ) -> Result<Self, TemplateError> {
+        let slots = slots
+            .into_iter()
+            .map(|(name, entries)| (name, to_weighted(entries)))
+            .collect();
+        Self::with_strictness_weighted(pattern, slots, rng, strictness)
+    }
+
+    /// Builds a generator whose slots carry weighted entries, validating
+    /// under [`Strictness::Strict`]. An entry's weight controls how often
+    /// it's picked relative to the other entries in its slot.
+    pub fn new_weighted(
+        pattern: &str,
+        slots: Vec<(&str, Vec<(String, u32)>)>,
+        rng: Rng,
+    ) -> Result<Self, TemplateError> {
+        Self::with_strictness_weighted(pattern, slots, rng, Strictness::Strict)
+    }
+
+    /// Builds a generator whose slots carry weighted entries, validating
+    /// under the given [`Strictness`].
+    pub fn with_strictness_weighted(
+        pattern: &str,
+        slots: Vec<(&str, Vec<(String, u32)>)>,
         rng: Rng,
         strictness: Strictness,
     ) -> Result<Self, TemplateError> {
@@ -313,8 +407,8 @@ impl TemplateGenerator {
         Ok(TemplateGenerator { slots: validated, pieces, rng })
     }
 
-    /// Renders the pattern once, picking a random entry from each slot's
-    /// word list.
+    /// Renders the pattern once, picking a weighted-random entry from each
+    /// slot's word list.
     pub fn generate(&mut self) -> String {
         let mut out = String::new();
         for piece in &self.pieces {
@@ -322,8 +416,7 @@ impl TemplateGenerator {
                 Piece::Literal(text) => out.push_str(text),
                 Piece::Slot(name) => {
                     let list = &self.slots[name];
-                    let entry = &list[self.rng.below(list.len())];
-                    out.push_str(entry);
+                    out.push_str(pick_weighted(&mut self.rng, list));
                 }
             }
         }
@@ -508,5 +601,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, TemplateError::List(BuildError::DuplicateEntry { .. })));
+    }
+
+    #[test]
+    fn weighted_strict_rejects_zero_weight() {
+        let err = NameGenerator::new_weighted(
+            vec![("Ada".to_string(), 0)],
+            vec![("Lovelace".to_string(), 1)],
+            Rng::from_seed(0),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            BuildError::ZeroWeight { list: "first_names".to_string(), entry: "Ada".to_string() }
+        );
+    }
+
+    #[test]
+    fn weighted_lenient_drops_zero_weight_entry() {
+        let generator = NameGenerator::with_strictness_weighted(
+            vec![("Ada".to_string(), 0), ("Grace".to_string(), 1)],
+            vec![("Lovelace".to_string(), 1)],
+            Rng::from_seed(0),
+            Strictness::Lenient,
+        );
+        assert!(generator.is_ok());
+    }
+
+    #[test]
+    fn weighted_lenient_rejects_list_left_empty_by_dropped_zero_weights() {
+        let err = NameGenerator::with_strictness_weighted(
+            vec![("Ada".to_string(), 0)],
+            vec![("Lovelace".to_string(), 1)],
+            Rng::from_seed(0),
+            Strictness::Lenient,
+        )
+        .unwrap_err();
+        assert_eq!(err, BuildError::EmptyList("first_names".to_string()));
+    }
+
+    #[test]
+    fn heavier_weight_is_picked_far_more_often() {
+        let mut generator = NameGenerator::new_weighted(
+            vec![("Rare".to_string(), 1), ("Common".to_string(), 99)],
+            vec![("Surname".to_string(), 1)],
+            Rng::from_seed(7),
+        )
+        .unwrap();
+
+        let common_count =
+            (0..200).filter(|_| generator.generate().starts_with("Common")).count();
+        assert!(common_count > 150, "expected the heavily weighted entry to dominate, got {common_count}/200");
+    }
+
+    #[test]
+    fn template_weighted_favors_heavier_slot_entry() {
+        let mut generator = TemplateGenerator::new_weighted(
+            "{word}",
+            vec![("word", vec![("rare".to_string(), 1), ("common".to_string(), 99)])],
+            Rng::from_seed(3),
+        )
+        .unwrap();
+
+        let common_count = (0..200).filter(|_| generator.generate() == "common").count();
+        assert!(common_count > 150, "expected the heavily weighted entry to dominate, got {common_count}/200");
     }
 }

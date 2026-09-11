@@ -105,6 +105,38 @@ as `NameGenerator`'s lists. A pattern that references a slot you didn't
 provide, or a `{` with no matching `}`, is also rejected at build time
 rather than producing a garbled name later.
 
+## Weighting entries
+
+By default every entry in a list is equally likely. If some names should
+come up more often - a handful of common surnames next to a long tail of
+rare ones - use the `_weighted` constructors and pair each entry with a
+weight:
+
+```rust
+use namesmith::{NameGenerator, Rng};
+
+let last_names = vec![
+    ("Smith".to_string(), 20),
+    ("Okafor".to_string(), 5),
+    ("Yamamoto".to_string(), 1),
+];
+
+let mut generator = NameGenerator::new_weighted(
+    vec![("Ada".to_string(), 1), ("Grace".to_string(), 1)],
+    last_names,
+    Rng::from_entropy(),
+)
+.expect("word lists should be clean");
+
+println!("{}", generator.generate());
+```
+
+`"Smith"` comes up 20 times as often as `"Yamamoto"` here. A weight of zero
+is rejected under `Strictness::Strict` (an entry that can never be picked
+is almost always a typo), and dropped instead of erroring under
+`Strictness::Lenient`. `TemplateGenerator` has the same pair of
+`new_weighted` / `with_strictness_weighted` constructors for its slots.
+
 ## Design notes
 
 - Zero dependencies. The crate ships its own seedable PRNG
@@ -118,10 +150,9 @@ rather than producing a garbled name later.
 
 ## Status
 
-Early. `NameGenerator` covers "first + last" pairs and `TemplateGenerator`
-covers arbitrary patterns; entries still can't be weighted, so every list
-entry is equally likely. See the roadmap in commit history for what's
-planned.
+Early. `NameGenerator` covers "first + last" pairs, `TemplateGenerator`
+covers arbitrary patterns, and both support weighted entries. See the
+roadmap in commit history for what's planned.
 
 ## License
 
