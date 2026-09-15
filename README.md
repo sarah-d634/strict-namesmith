@@ -75,6 +75,34 @@ let generator = NameGenerator::with_strictness(
 assert!(generator.is_ok());
 ```
 
+## Loading lists from text
+
+Word lists usually start life as a text file, not a `Vec<String>` someone
+typed into source. `from_lines` takes the raw contents of a file (or any
+string with one entry per line) and does the split for you: blank lines
+and lines starting with `#` are skipped, everything else is trimmed and
+handed to the same strict-by-default validation as the other constructors.
+
+```rust
+use namesmith::{NameGenerator, Rng};
+
+let first_names = "Ada\nGrace\n\n# add more later\nAlan\n";
+let last_names = "Lovelace\nHopper\nTuring\n";
+
+let mut generator =
+    NameGenerator::from_lines(first_names, last_names, Rng::from_entropy())
+        .expect("word lists should be clean");
+
+println!("{}", generator.generate());
+```
+
+`TemplateGenerator::from_lines` takes the same pattern-and-slots shape as
+`TemplateGenerator::new`, just with each slot's word list as a block of
+text instead of a `Vec<String>`. Both types also have
+`with_strictness_from_lines` for `Strictness::Lenient` input. If you
+already have parsed strings in hand and just want the line-splitting
+logic, `parse_word_list` is exposed directly.
+
 ## Patterns beyond "first last"
 
 `NameGenerator` only ever combines a first name and a last name. For

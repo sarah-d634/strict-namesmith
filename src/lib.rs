@@ -169,6 +169,31 @@ impl NameGenerator {
         Ok(NameGenerator { first_names, last_names, rng })
     }
 
+    /// Builds a generator from raw text, one entry per line, validating
+    /// both lists under [`Strictness::Strict`]. See [`parse_word_list`] for
+    /// how lines are turned into entries - this is a shortcut for calling
+    /// it yourself and passing the result to [`NameGenerator::new`].
+    pub fn from_lines(first_names: &str, last_names: &str, rng: Rng) -> Result<Self, BuildError> {
+        Self::with_strictness_from_lines(first_names, last_names, rng, Strictness::Strict)
+    }
+
+    /// Builds a generator from raw text, one entry per line, validating
+    /// both lists under the given [`Strictness`]. See [`parse_word_list`]
+    /// for how lines are turned into entries.
+    pub fn with_strictness_from_lines(
+        first_names: &str,
+        last_names: &str,
+        rng: Rng,
+        strictness: Strictness,
+    ) -> Result<Self, BuildError> {
+        Self::with_strictness(
+            parse_word_list(first_names),
+            parse_word_list(last_names),
+            rng,
+            strictness,
+        )
+    }
+
     /// Picks a random first name and last name, weighted by their configured
     /// weights, and joins them with a space.
     pub fn generate(&mut self) -> String {
@@ -182,6 +207,28 @@ impl NameGenerator {
 /// the same validation and selection code as a weighted one.
 fn to_weighted(entries: Vec<String>) -> Vec<(String, u32)> {
     entries.into_iter().map(|entry| (entry, 1)).collect()
+}
+
+/// Splits raw text into a word list, one entry per line. Blank lines and
+/// lines whose first non-whitespace character is `#` are skipped; every
+/// other line is trimmed before being kept. This is meant for loading a
+/// list straight from a text file's contents without writing a parser for
+/// it first - the result still goes through a generator's usual
+/// [`Strictness`] check, so a typo on a line is caught the same way it
+/// would be for a hand-built `Vec<String>`.
+///
+/// ```
+/// use namesmith::parse_word_list;
+///
+/// let names = parse_word_list("Ada\n\n# first names\nGrace  \n");
+/// assert_eq!(names, vec!["Ada".to_string(), "Grace".to_string()]);
+/// ```
+pub fn parse_word_list(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect()
 }
 
 fn validate_list(
@@ -405,6 +452,33 @@ impl TemplateGenerator {
         }
 
         Ok(TemplateGenerator { slots: validated, pieces, rng })
+    }
+
+    /// Builds a generator whose slots come from raw text, one entry per
+    /// line, validating under [`Strictness::Strict`]. See
+    /// [`parse_word_list`] for how lines are turned into entries.
+    pub fn from_lines(
+        pattern: &str,
+        slots: Vec<(&str, &str)>,
+        rng: Rng,
+    ) -> Result<Self, TemplateError> {
+        Self::with_strictness_from_lines(pattern, slots, rng, Strictness::Strict)
+    }
+
+    /// Builds a generator whose slots come from raw text, one entry per
+    /// line, validating under the given [`Strictness`]. See
+    /// [`parse_word_list`] for how lines are turned into entries.
+    pub fn with_strictness_from_lines(
+        pattern: &str,
+        slots: Vec<(&str, &str)>,
+        rng: Rng,
+        strictness: Strictness,
+    ) -> Result<Self, TemplateError> {
+        let slots = slots
+            .into_iter()
+            .map(|(name, text)| (name, parse_word_list(text)))
+            .collect();
+        Self::with_strictness(pattern, slots, rng, strictness)
     }
 
     /// Renders the pattern once, picking a weighted-random entry from each
@@ -638,6 +712,45 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, BuildError::EmptyList("first_names".to_string()));
+    }
+
+    #[test]
+    fn parse_word_list_skips_blank_lines_and_comments_and_trims() {
+        let parsed = parse_word_list("Ada\n\n  \n# first names\nGrace  \n\t\n");
+        assert_eq!(parsed, strs(&["Ada", "Grace"]));
+    }
+
+    #[test]
+    fn name_generator_from_lines_builds_a_working_generator() {
+        let mut generator = NameGenerator::from_lines(
+            "Ada\nGrace\n",
+            "# surnames\nLovelace\nHopper\n",
+            Rng::from_seed(2),
+        )
+        .unwrap();
+        let name = generator.generate();
+        let mut parts = name.split(' ');
+        assert!(["Ada", "Grace"].contains(&parts.next().unwrap()));
+        assert!(["Lovelace", "Hopper"].contains(&parts.next().unwrap()));
+    }
+
+    #[test]
+    fn name_generator_from_lines_still_validates_strictly() {
+        let err = NameGenerator::from_lines("Ada\nAda\n", "Lovelace\n", Rng::from_seed(0))
+            .unwrap_err();
+        assert!(matches!(err, BuildError::DuplicateEntry { .. }));
+    }
+
+    #[test]
+    fn template_generator_from_lines_builds_a_working_generator() {
+        let mut generator = TemplateGenerator::from_lines(
+            "{first} {last}",
+            vec![("first", "Ada\nGrace\n"), ("last", "Lovelace\nHopper\n")],
+            Rng::from_seed(5),
+        )
+        .unwrap();
+        let name = generator.generate();
+        assert_eq!(name.split(' ').count(), 2);
     }
 
     #[test]
