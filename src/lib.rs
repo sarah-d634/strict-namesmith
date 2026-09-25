@@ -39,6 +39,19 @@
 //! .unwrap();
 //! assert_eq!(generator.generate(), "Grace \"Amazing\" Hopper");
 //! ```
+//!
+//! Both of those pick whole entries out of a list you supply. If you'd
+//! rather generate names that merely resemble a set of examples - useful
+//! when you don't have enough entries to make picking from a list feel
+//! varied - train a [`MarkovGenerator`] on them instead:
+//!
+//! ```
+//! use namesmith::{MarkovGenerator, Rng};
+//!
+//! let examples = vec!["Aria".to_string(), "Ariana".to_string(), "Marina".to_string()];
+//! let mut generator = MarkovGenerator::new(examples, 2, Rng::from_seed(1)).unwrap();
+//! assert!(!generator.generate().is_empty());
+//! ```
 
 mod rng;
 
@@ -498,6 +511,180 @@ impl TemplateGenerator {
     }
 }
 
+/// Why building a [`MarkovGenerator`] failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkovError {
+    /// `order` was zero; a chain needs at least one character of context to
+    /// pick the next one from.
+    ZeroOrder,
+    /// No training examples were given.
+    EmptyExamples,
+    /// A training example was the empty string.
+    EmptyEntry { index: usize },
+    /// A training example contained a character other than a letter,
+    /// hyphen, or apostrophe.
+    InvalidCharacter { entry: String, ch: char },
+}
+
+impl fmt::Display for MarkovError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MarkovError::ZeroOrder => write!(f, "order must be at least 1"),
+            MarkovError::EmptyExamples => write!(f, "no training examples were given"),
+            MarkovError::EmptyEntry { index } => write!(f, "training example {index} is empty"),
+            MarkovError::InvalidCharacter { entry, ch } => write!(
+                f,
+                "training example {entry:?} contains disallowed character {ch:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MarkovError {}
+
+/// Marks the fixed-length run of context that precedes the first real
+/// character of a training example, so a chain has something to key off of
+/// when generating the start of a name.
+const BOUNDARY: char = '\u{0}';
+/// Recorded as the "next character" after the last real character of a
+/// training example, so generation can pick to stop instead of running to
+/// `max_length` every time.
+const END: char = '\u{1}';
+
+/// Default cap on generated name length, used when a [`MarkovGenerator`] is
+/// built with [`MarkovGenerator::new`] instead of
+/// [`MarkovGenerator::with_max_length`]. Only matters if the chain happens
+/// to cycle without ever landing on the end marker.
+pub const DEFAULT_MAX_LENGTH: usize = 40;
+
+/// Generates names by learning which characters tend to follow which from a
+/// set of example names, instead of picking whole words out of a list.
+///
+/// Where [`NameGenerator`] and [`TemplateGenerator`] only ever reproduce
+/// entries you already wrote down, `MarkovGenerator` learns the texture of
+/// your examples - common letter pairs, typical endings - and produces new
+/// names that share that texture without being copies of the input.
+///
+/// `order` is how many preceding characters the chain looks at to pick the
+/// next one. Order 1 only knows "which letter follows this letter" and
+/// tends to produce noise; order 2 or 3 usually reads as name-like; higher
+/// orders stick closer to the training data and eventually just reproduce
+/// it verbatim.
+///
+/// ```
+/// use namesmith::{MarkovGenerator, Rng};
+///
+/// let examples = vec![
+///     "Aria".to_string(), "Ariana".to_string(), "Marina".to_string(),
+///     "Ada".to_string(), "Amara".to_string(), "Ariel".to_string(),
+/// ];
+/// let mut generator = MarkovGenerator::new(examples, 2, Rng::from_seed(1)).unwrap();
+/// let name = generator.generate();
+/// assert!(!name.is_empty());
+/// ```
+pub struct MarkovGenerator {
+    max_length: usize,
+    transitions: HashMap<Vec<char>, Vec<(char, u32)>>,
+    order: usize,
+    rng: Rng,
+}
+
+impl MarkovGenerator {
+    /// Trains a chain of the given `order` on `examples`, capping generated
+    /// names at [`DEFAULT_MAX_LENGTH`] characters.
+    pub fn new(examples: Vec<String>, order: usize, rng: Rng) -> Result<Self, MarkovError> {
+        Self::with_max_length(examples, order, DEFAULT_MAX_LENGTH, rng)
+    }
+
+    /// Trains a chain of the given `order` on `examples`, capping generated
+    /// names at `max_length` characters. The cap only matters if the chain
+    /// cycles without landing on its learned end-of-name transition.
+    pub fn with_max_length(
+        examples: Vec<String>,
+        order: usize,
+        max_length: usize,
+        rng: Rng,
+    ) -> Result<Self, MarkovError> {
+        if order == 0 {
+            return Err(MarkovError::ZeroOrder);
+        }
+        if examples.is_empty() {
+            return Err(MarkovError::EmptyExamples);
+        }
+        let mut transitions: HashMap<Vec<char>, Vec<(char, u32)>> = HashMap::new();
+        for (index, example) in examples.iter().enumerate() {
+            if example.is_empty() {
+                return Err(MarkovError::EmptyEntry { index });
+            }
+            if let Some(ch) = example.chars().find(|c| !is_name_char(*c)) {
+                return Err(MarkovError::InvalidCharacter { entry: example.clone(), ch });
+            }
+            train(&mut transitions, example, order);
+        }
+        Ok(MarkovGenerator { max_length, transitions, order, rng })
+    }
+
+    /// Trains a chain from raw text, one example per line, capping generated
+    /// names at [`DEFAULT_MAX_LENGTH`] characters. See [`parse_word_list`]
+    /// for how lines are turned into examples.
+    pub fn from_lines(text: &str, order: usize, rng: Rng) -> Result<Self, MarkovError> {
+        Self::new(parse_word_list(text), order, rng)
+    }
+
+    /// Walks the chain from its start state, picking a weighted-random next
+    /// character at each step, until it lands on the learned end-of-name
+    /// transition or hits `max_length` characters.
+    pub fn generate(&mut self) -> String {
+        let mut context = vec![BOUNDARY; self.order];
+        let mut out = String::new();
+        while out.chars().count() < self.max_length {
+            let choices = &self.transitions[&context];
+            let next = pick_weighted_char(&mut self.rng, choices);
+            if next == END {
+                break;
+            }
+            out.push(next);
+            context.remove(0);
+            context.push(next);
+        }
+        out
+    }
+}
+
+/// Feeds one training example into a chain's transition table: `order`
+/// boundary characters, then the example's own characters, then the end
+/// marker, so every context from "start of name" through "end of name" gets
+/// recorded.
+fn train(transitions: &mut HashMap<Vec<char>, Vec<(char, u32)>>, example: &str, order: usize) {
+    let mut sequence: Vec<char> = vec![BOUNDARY; order];
+    sequence.extend(example.chars());
+    sequence.push(END);
+    for window in sequence.windows(order + 1) {
+        let context = window[..order].to_vec();
+        let next = window[order];
+        let counts = transitions.entry(context).or_default();
+        match counts.iter_mut().find(|(ch, _)| *ch == next) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((next, 1)),
+        }
+    }
+}
+
+/// Picks one character from a non-empty weighted list of `(char, count)`
+/// pairs, the same way [`pick_weighted`] does for word list entries.
+fn pick_weighted_char(rng: &mut Rng, choices: &[(char, u32)]) -> char {
+    let total: u64 = choices.iter().map(|(_, count)| *count as u64).sum();
+    let mut target = rng.below(total as usize) as u64;
+    for (ch, count) in choices {
+        let count = *count as u64;
+        if target < count {
+            return *ch;
+        }
+        target -= count;
+    }
+    unreachable!("target should fall within the total weight of a non-empty list")
+}
+
 /// Splits a pattern like `"{first} {last}"` into a sequence of literal text
 /// and named slot placeholders.
 fn parse_pattern(pattern: &str) -> Result<Vec<Piece>, TemplateError> {
@@ -778,5 +965,76 @@ mod tests {
 
         let common_count = (0..200).filter(|_| generator.generate() == "common").count();
         assert!(common_count > 150, "expected the heavily weighted entry to dominate, got {common_count}/200");
+    }
+
+    #[test]
+    fn markov_rejects_zero_order() {
+        let err = MarkovGenerator::new(strs(&["Ada"]), 0, Rng::from_seed(0)).unwrap_err();
+        assert_eq!(err, MarkovError::ZeroOrder);
+    }
+
+    #[test]
+    fn markov_rejects_empty_examples() {
+        let err = MarkovGenerator::new(vec![], 2, Rng::from_seed(0)).unwrap_err();
+        assert_eq!(err, MarkovError::EmptyExamples);
+    }
+
+    #[test]
+    fn markov_rejects_empty_entry() {
+        let err = MarkovGenerator::new(strs(&["Ada", ""]), 2, Rng::from_seed(0)).unwrap_err();
+        assert_eq!(err, MarkovError::EmptyEntry { index: 1 });
+    }
+
+    #[test]
+    fn markov_rejects_invalid_character() {
+        let err = MarkovGenerator::new(strs(&["Ada 2"]), 2, Rng::from_seed(0)).unwrap_err();
+        assert!(matches!(err, MarkovError::InvalidCharacter { ch: ' ', .. }));
+    }
+
+    #[test]
+    fn markov_generates_nonempty_names_within_max_length() {
+        let examples = strs(&[
+            "Aria", "Ariana", "Marina", "Ada", "Amara", "Ariel", "Mara", "Ana",
+        ]);
+        let mut generator = MarkovGenerator::new(examples, 2, Rng::from_seed(11)).unwrap();
+        for _ in 0..50 {
+            let name = generator.generate();
+            assert!(!name.is_empty());
+            assert!(name.chars().count() <= DEFAULT_MAX_LENGTH);
+            assert!(name.chars().all(is_name_char));
+        }
+    }
+
+    #[test]
+    fn markov_same_seed_same_output() {
+        let examples = || strs(&["Aria", "Ariana", "Marina", "Ada", "Amara"]);
+        let mut a = MarkovGenerator::new(examples(), 2, Rng::from_seed(99)).unwrap();
+        let mut b = MarkovGenerator::new(examples(), 2, Rng::from_seed(99)).unwrap();
+        for _ in 0..20 {
+            assert_eq!(a.generate(), b.generate());
+        }
+    }
+
+    #[test]
+    fn markov_respects_custom_max_length() {
+        let mut generator =
+            MarkovGenerator::with_max_length(strs(&["Ada", "Amara", "Ariana"]), 1, 3, Rng::from_seed(5))
+                .unwrap();
+        for _ in 0..50 {
+            assert!(generator.generate().chars().count() <= 3);
+        }
+    }
+
+    #[test]
+    fn markov_from_lines_builds_a_working_generator() {
+        let mut generator =
+            MarkovGenerator::from_lines("Ada\nGrace\n\n# more\nAlan\n", 2, Rng::from_seed(2)).unwrap();
+        assert!(!generator.generate().is_empty());
+    }
+
+    #[test]
+    fn markov_order_one_can_reproduce_a_single_example() {
+        let mut generator = MarkovGenerator::new(strs(&["Ada"]), 1, Rng::from_seed(0)).unwrap();
+        assert_eq!(generator.generate(), "Ada");
     }
 }

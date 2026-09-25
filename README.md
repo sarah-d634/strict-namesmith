@@ -165,6 +165,47 @@ is almost always a typo), and dropped instead of erroring under
 `Strictness::Lenient`. `TemplateGenerator` has the same pair of
 `new_weighted` / `with_strictness_weighted` constructors for its slots.
 
+## Markov chain synthesis
+
+`NameGenerator` and `TemplateGenerator` both pick whole entries out of a
+list you already wrote. `MarkovGenerator` does something different: it
+trains on a set of example names and generates new ones that share their
+letter patterns, without necessarily reproducing any of the inputs
+verbatim. This is useful when a hand-written list would feel repetitive
+with only a handful of entries - a dozen examples can already produce a
+much larger variety of plausible-looking output.
+
+```rust
+use namesmith::{MarkovGenerator, Rng};
+
+let examples = vec![
+    "Aria".to_string(), "Ariana".to_string(), "Marina".to_string(),
+    "Ada".to_string(), "Amara".to_string(), "Ariel".to_string(),
+];
+
+let mut generator = MarkovGenerator::new(examples, 2, Rng::from_entropy())
+    .expect("training examples should be clean");
+
+for _ in 0..5 {
+    println!("{}", generator.generate());
+}
+```
+
+The second argument is the chain's order: how many preceding characters it
+looks at to pick the next one. Order 1 only knows which letter tends to
+follow which and reads as noise; order 2 or 3 usually produces
+name-shaped output; higher orders stay closer to the training data and
+eventually reproduce it outright. `from_lines` loads examples from raw
+text the same way the other generators do, and `with_max_length` caps how
+long a generated name can get, in case the chain happens to cycle without
+ever landing on its learned end-of-name transition.
+
+Training examples go through a lighter check than `NameGenerator`'s lists:
+an empty entry or a disallowed character is still rejected, but repeats
+are fine (they're exactly how a pattern gets weighted more heavily) and
+there's no `Strictness` knob, since trimming or de-duplicating the input
+would just be throwing training data away.
+
 ## Design notes
 
 - Zero dependencies. The crate ships its own seedable PRNG
@@ -179,8 +220,10 @@ is almost always a typo), and dropped instead of erroring under
 ## Status
 
 Early. `NameGenerator` covers "first + last" pairs, `TemplateGenerator`
-covers arbitrary patterns, and both support weighted entries. See the
-roadmap in commit history for what's planned.
+covers arbitrary patterns, both support weighted entries, and
+`MarkovGenerator` covers synthesizing new names from examples rather than
+picking from a fixed list. See the roadmap in commit history for what's
+planned.
 
 ## License
 
